@@ -142,7 +142,7 @@ thead tr th { background:#040d18 !important; color:#4a6a88 !important; font-fami
 #  CONSTANTS
 # ─────────────────────────────────────────────────────────────
 CHANNEL_ID  = "3244796"
-READ_API    = "6QLIS15N3QQTV21C"
+READ_API    = "LS4303YQRIN4ZWXN"
 
 LABEL_COLOR = {
     "Normal":              "#22c55e",
