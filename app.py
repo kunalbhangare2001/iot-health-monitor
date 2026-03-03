@@ -1,5 +1,4 @@
 import streamlit as st
-import requests
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -7,14 +6,14 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import time
-import json
+import io
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import io
 import warnings
 warnings.filterwarnings("ignore")
 
+from supabase import create_client, Client
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
@@ -118,6 +117,19 @@ for k, v in {
         st.session_state[k] = v
 
 # ═════════════════════════════════════════════════════════
+#  SUPABASE CONNECTION
+#  Add these to Streamlit secrets (.streamlit/secrets.toml):
+#  [supabase]
+#  url = "https://fevnqqwowsbshtakrpuv.supabase.co"
+#  key = "your_anon_public_key"
+# ═════════════════════════════════════════════════════════
+@st.cache_resource
+def get_supabase() -> Client:
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    return create_client(url, key)
+
+# ═════════════════════════════════════════════════════════
 #  HEALTH LABEL
 # ═════════════════════════════════════════════════════════
 def label_health(bpm, spo2):
@@ -130,104 +142,66 @@ def label_health(bpm, spo2):
     else:             return "Normal"
 
 def badge_class(label):
-    if label == "Normal":                 return "badge-normal"
-    if "Critical" in label:              return "badge-critical"
-    if label in ("Tachycardia","Bradycardia","Hypoxia","Severe Bradycardia","Severe Tachycardia"):
-        return "badge-warning"
-    return "badge-critical"
+    if label == "Normal":   return "badge-normal"
+    if "Critical" in label: return "badge-critical"
+    return "badge-warning"
 
 # ═════════════════════════════════════════════════════════
-#  LOAD PATIENTS FROM THINGSPEAK REGISTRY
+#  LOAD ALL PATIENTS FROM SUPABASE
 # ═════════════════════════════════════════════════════════
-THINGSPEAK_USER_API = st.secrets.get("thingspeak", {}).get("user_api_key", "")
-REGISTRY_CHANNEL_ID = st.secrets.get("thingspeak", {}).get("registry_channel_id", "")
-
 @st.cache_data(ttl=30)
 def load_patient_db():
-    """
-    Reads ALL patients from ThingSpeak registry.
-    Auto-refreshes every 30s — new patients added via test_sender.py
-    appear automatically without any manual update.
-    """
-    if REGISTRY_CHANNEL_ID and THINGSPEAK_USER_API:
-        try:
-            r = requests.get(
-                f"https://api.thingspeak.com/channels/{REGISTRY_CHANNEL_ID}.json",
-                params={"api_key": THINGSPEAK_USER_API}, timeout=10
-            )
-            if r.status_code == 200:
-                meta     = r.json().get("metadata", "{}")
-                patients = json.loads(meta).get("patients", []) if meta else []
-                if patients:
-                    return patients
-        except Exception as e:
-            st.sidebar.warning(f"Registry error: {e}")
+    """Fetch all patients from Supabase — refreshes every 30s."""
+    try:
+        supabase = get_supabase()
+        res = supabase.table("patients").select("*").order("id").execute()
+        if res.data:
+            return res.data
+    except Exception as e:
+        st.sidebar.warning(f"Could not load patients: {e}")
 
-    # Fallback — demo patient
+    # Fallback demo patient
     return [{
         "id": "P001", "name": "Demo Patient", "age": 30,
-        "gender": "Unknown", "doctor": "Dr. Unknown",
-        "condition": "Unknown", "ward": "General",
-        "channel_id": "3244796",
-        "read_api":  "LS4303YQRIN4ZWXN",
-        "write_api": "RBXI8KKTDOK00CMB",
-        "admitted": "2026-03-01", "phone": "N/A"
+        "doctor": "Dr. Unknown", "admitted": "2026-03-01",
     }]
 
 # ═════════════════════════════════════════════════════════
-#  FETCH PATIENT DATA FROM THINGSPEAK
+#  FETCH READINGS FOR A PATIENT FROM SUPABASE
 # ═════════════════════════════════════════════════════════
 @st.cache_data(ttl=15)
-def fetch_data(channel_id, read_api, results=300):
-    url = (f"https://api.thingspeak.com/channels/{channel_id}/feeds.json"
-           f"?api_key={read_api}&results={results}")
+def fetch_data(patient_id: str, results: int = 300):
+    """Load readings for a patient from Supabase readings table."""
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        feeds = r.json().get("feeds", [])
-        if not feeds:
-            return None, "No data yet. Run test_sender.py to send data."
+        supabase = get_supabase()
+        res = supabase.table("readings") \
+                      .select("*") \
+                      .eq("patient_id", patient_id) \
+                      .order("recorded_at", desc=True) \
+                      .limit(results) \
+                      .execute()
 
-        df   = pd.DataFrame(feeds)
-        df["created_at"] = pd.to_datetime(df["created_at"])
-        fcols = [c for c in df.columns if c.startswith("field")]
-        if not fcols:
-            return None, "No field columns found in channel."
+        if not res.data:
+            return None, "No readings yet. Run medpulse_supabase.py to send data."
 
-        for fc in fcols:
-            df[fc] = pd.to_numeric(df[fc], errors="coerce")
-        df = df.dropna(subset=fcols, how="all")
-        if df.empty:
-            return None, "All field values are empty."
+        df = pd.DataFrame(res.data)
+        df["recorded_at"] = pd.to_datetime(df["recorded_at"])
+        df = df.sort_values("recorded_at").reset_index(drop=True)
 
-        # Auto-detect BPM vs SpO2
-        if "field1" in df.columns and "field2" in df.columns:
-            f1m = df["field1"].mean()
-            f2m = df["field2"].mean()
-            if 80 <= f1m <= 100 and (f2m > 100 or f2m < 80):
-                df["bpm"]  = df["field2"]
-                df["spo2"] = df["field1"]
-            else:
-                df["bpm"]  = df["field1"]
-                df["spo2"] = df["field2"]
-        else:
-            df["bpm"]  = df[fcols[0]]
-            df["spo2"] = 98.0
+        df["bpm"]  = pd.to_numeric(df["bpm"],  errors="coerce")
+        df["spo2"] = pd.to_numeric(df["spo2"], errors="coerce")
+        df = df.dropna(subset=["bpm", "spo2"])
 
-        df = df.dropna(subset=["bpm"]).copy()
-        df["spo2"] = df["spo2"].fillna(98.0)
-        df["bpm"]  = df["bpm"].clip(20, 300)
-        df["spo2"] = df["spo2"].clip(50, 100)
         if df.empty:
             return None, "No valid readings after filtering."
 
-        df = df.sort_values("created_at").reset_index(drop=True)
-        df["label"] = df.apply(lambda r: label_health(r["bpm"], r["spo2"]), axis=1)
-        df["date"]  = df["created_at"].dt.date
+        df["bpm"]        = df["bpm"].clip(20, 300)
+        df["spo2"]       = df["spo2"].clip(50, 100)
+        df["label"]      = df.apply(lambda r: label_health(r["bpm"], r["spo2"]), axis=1)
+        df["date"]       = df["recorded_at"].dt.date
+        df["created_at"] = df["recorded_at"]   # keep alias for chart compatibility
         return df, None
 
-    except requests.exceptions.HTTPError as e:
-        return None, f"HTTP {e.response.status_code} — check Channel ID and Read API Key."
     except Exception as e:
         return None, str(e)
 
@@ -235,17 +209,13 @@ def fetch_data(channel_id, read_api, results=300):
 #  TRAIN ML MODELS
 # ═════════════════════════════════════════════════════════
 @st.cache_resource
-def train_models(channel_id, data_hash):
-    """Train models on this patient's own data."""
-    df, err = fetch_data(
-        st.session_state.get("_ch_id",""),
-        st.session_state.get("_r_key",""), 300
-    )
+def train_models(patient_id, data_hash):
+    df, err = fetch_data(patient_id, 300)
     if err or df is None or len(df) < 5:
         return None
 
-    X = df[["bpm","spo2"]].values
-    y = df["label"].values
+    X  = df[["bpm","spo2"]].values
+    y  = df["label"].values
     sc = StandardScaler()
     Xs = sc.fit_transform(X)
 
@@ -255,10 +225,10 @@ def train_models(channel_id, data_hash):
         y  = np.tile(y, 7)
 
     mdls = {
-        "KNN":                KNeighborsClassifier(n_neighbors=min(5,len(Xs)-1)),
-        "Logistic Regression":LogisticRegression(max_iter=1000),
-        "Random Forest":      RandomForestClassifier(n_estimators=100, random_state=42),
-        "SVM":                SVC(probability=True, random_state=42),
+        "KNN":                 KNeighborsClassifier(n_neighbors=min(5,len(Xs)-1)),
+        "Logistic Regression": LogisticRegression(max_iter=1000),
+        "Random Forest":       RandomForestClassifier(n_estimators=100, random_state=42),
+        "SVM":                 SVC(probability=True, random_state=42),
     }
     for m in mdls.values(): m.fit(Xs, y)
     iso = IsolationForest(contamination=0.1, random_state=42)
@@ -334,15 +304,12 @@ def generate_pdf(patient, df, predictions):
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#d0e4f7")))
     story.append(Spacer(1,.4*cm))
 
-    # Patient info
     story.append(Paragraph("Patient Information", H))
     info_data = [["Field","Value"],
-                 ["Name",      patient["name"]],
-                 ["Age",       f"{patient['age']} yrs  |  {patient['gender']}"],
-                 ["Doctor",    patient["doctor"]],
-                 ["Condition", patient["condition"]],
-                 ["Ward",      patient["ward"]],
-                 ["Admitted",  patient["admitted"]]]
+                 ["Name",     patient["name"]],
+                 ["Age",      str(patient.get("age","—"))],
+                 ["Doctor",   patient.get("doctor","—")],
+                 ["Admitted", patient.get("admitted","—")]]
     t = Table(info_data, colWidths=[5*cm,11.5*cm])
     t.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#1e3a5f")),
@@ -356,7 +323,6 @@ def generate_pdf(patient, df, predictions):
     story.append(t)
     story.append(Spacer(1,.4*cm))
 
-    # Vitals summary
     story.append(Paragraph("Vitals Summary", H))
     latest = df.iloc[-1]
     vs = [["Parameter","Latest","Mean","Min","Max"],
@@ -379,12 +345,10 @@ def generate_pdf(patient, df, predictions):
     story.append(t2)
     story.append(Spacer(1,.4*cm))
 
-    # ML predictions
     story.append(Paragraph("ML Model Predictions", H))
     for mname,(pred,conf) in predictions.items():
         story.append(Paragraph(f"<b>{mname}:</b>  {pred}  ({conf:.1f}% confidence)", B))
 
-    # Distribution
     story.append(Paragraph("Health Status Distribution", H))
     dist = df["label"].value_counts()
     for lbl,cnt in dist.items():
@@ -439,18 +403,18 @@ def show_login():
 # ═════════════════════════════════════════════════════════
 def page_dashboard(df, pkg, patient, bpm_high, bpm_low, spo2_low, auto_refresh, refresh_sec):
     if df is None or df.empty or len(df) < 2:
-        st.warning("Not enough data yet. Run test_sender.py to send readings.")
+        st.warning("Not enough data yet. Run medpulse_supabase.py to send readings.")
         return
 
-    latest     = df.iloc[-1]
-    bpm_val    = float(latest["bpm"])
-    spo2_val   = float(latest["spo2"])
-    lbl        = latest["label"]
-    lbl_color  = LABEL_COLOR.get(lbl, "#dce8f5")
-    ts         = latest["created_at"].strftime("%H:%M:%S  %d %b %Y")
-    d_bpm      = bpm_val  - float(df.iloc[-2]["bpm"])
-    d_spo2     = spo2_val - float(df.iloc[-2]["spo2"])
-    normal_pct = len(df[df["label"]=="Normal"]) / len(df) * 100
+    latest    = df.iloc[-1]
+    bpm_val   = float(latest["bpm"])
+    spo2_val  = float(latest["spo2"])
+    lbl       = latest["label"]
+    lbl_color = LABEL_COLOR.get(lbl, "#dce8f5")
+    ts        = latest["recorded_at"].strftime("%H:%M:%S  %d %b %Y")
+    d_bpm     = bpm_val  - float(df.iloc[-2]["bpm"])
+    d_spo2    = spo2_val - float(df.iloc[-2]["spo2"])
+    normal_pct= len(df[df["label"]=="Normal"]) / len(df) * 100
 
     st.markdown('<div class="sec-head">LIVE VITALS</div>', unsafe_allow_html=True)
     c1,c2,c3,c4 = st.columns(4)
@@ -504,10 +468,10 @@ def page_dashboard(df, pkg, patient, bpm_high, bpm_low, spo2_low, auto_refresh, 
     # Time series
     st.markdown('<div class="sec-head">TIME SERIES</div>', unsafe_allow_html=True)
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=df["created_at"], y=df["bpm"],  name="BPM",
+    fig.add_trace(go.Scatter(x=df["recorded_at"], y=df["bpm"],  name="BPM",
                               line=dict(color="#f97316", width=2),
                               fill="tozeroy", fillcolor="rgba(249,115,22,.06)"), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df["created_at"], y=df["spo2"], name="SpO₂%",
+    fig.add_trace(go.Scatter(x=df["recorded_at"], y=df["spo2"], name="SpO₂%",
                               line=dict(color="#3b82f6", width=2),
                               fill="tozeroy", fillcolor="rgba(59,130,246,.05)"), secondary_y=True)
     fig.add_hline(y=bpm_high, line_dash="dot", line_color="rgba(239,68,68,.35)", annotation_text="High BPM",  secondary_y=False)
@@ -527,7 +491,7 @@ def page_dashboard(df, pkg, patient, bpm_high, bpm_low, spo2_low, auto_refresh, 
 # ═════════════════════════════════════════════════════════
 def page_ml(df, pkg, patient):
     if pkg is None or not pkg.get("models"):
-        st.warning("Need more data to train models. Send at least 10 readings via test_sender.py")
+        st.warning("Need more data to train models. Send at least 10 readings.")
         return
 
     st.markdown('<div class="sec-head">ML PREDICTION</div>', unsafe_allow_html=True)
@@ -539,7 +503,7 @@ def page_ml(df, pkg, patient):
         spo2_in = st.number_input("SpO₂%", value=float(latest["spo2"]), step=0.1)
     X_in  = scaler.transform([[bpm_in, spo2_in]])
     with c2:
-        cols  = st.columns(len(models))
+        cols = st.columns(len(models))
         for i,(name,model) in enumerate(models.items()):
             pred  = model.predict(X_in)[0]
             proba = model.predict_proba(X_in)[0]
@@ -553,7 +517,6 @@ def page_ml(df, pkg, patient):
                   <div class="conf-bar"><div class="conf-fill" style="width:{conf:.0f}%;background:{color}"></div></div>
                 </div>""", unsafe_allow_html=True)
 
-    # Accuracy
     st.markdown('<div class="sec-head">MODEL ACCURACY</div>', unsafe_allow_html=True)
     X_all = scaler.transform(df[["bpm","spo2"]].values); y_all = df["label"].values
     accs  = [accuracy_score(y_all, m.predict(X_all))*100 for m in models.values()]
@@ -565,7 +528,6 @@ def page_ml(df, pkg, patient):
     fig.update_layout(height=260, yaxis=dict(range=[0,110]), title="Accuracy on Patient Data", **PLOT_LAYOUT)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Confusion matrix — best model
     st.markdown('<div class="sec-head">CONFUSION MATRIX — RANDOM FOREST</div>', unsafe_allow_html=True)
     rf  = models["Random Forest"]
     pds = rf.predict(X_all)
@@ -577,7 +539,6 @@ def page_ml(df, pkg, patient):
     fig2.update_layout(height=340, title="Confusion Matrix", **PLOT_LAYOUT)
     st.plotly_chart(fig2, use_container_width=True)
 
-    # Feature importance
     st.markdown('<div class="sec-head">FEATURE IMPORTANCE</div>', unsafe_allow_html=True)
     fi  = rf.feature_importances_
     fig3= go.Figure(go.Bar(x=["BPM","SpO₂"], y=fi*100,
@@ -620,10 +581,10 @@ def page_anomaly(df, pkg):
           <div class="mcard-unit">BPM @ SpO₂ {worst['spo2']:.1f}%</div></div>""", unsafe_allow_html=True)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df2["created_at"], y=df2["anomaly_score"], name="Score",
+    fig.add_trace(go.Scatter(x=df2["recorded_at"], y=df2["anomaly_score"], name="Score",
                               line=dict(color="#4a6a88",width=1.5), fill="tozeroy",
                               fillcolor="rgba(74,106,136,.06)"))
-    fig.add_trace(go.Scatter(x=anom["created_at"], y=anom["anomaly_score"],
+    fig.add_trace(go.Scatter(x=anom["recorded_at"], y=anom["anomaly_score"],
                               mode="markers", name="⚠️ Anomaly",
                               marker=dict(color="#ef4444",size=9,symbol="x")))
     fig.add_hline(y=0, line_dash="dot", line_color="rgba(239,68,68,.4)", annotation_text="Threshold")
@@ -646,8 +607,8 @@ def page_anomaly(df, pkg):
 def page_prediction(df):
     st.markdown('<div class="sec-head">FORECAST — NEXT 30 READINGS</div>', unsafe_allow_html=True)
     n = 30
-    last_t    = df["created_at"].iloc[-1]
-    avg_int   = (df["created_at"].iloc[-1] - df["created_at"].iloc[0]).total_seconds() / max(len(df)-1,1)
+    last_t    = df["recorded_at"].iloc[-1]
+    avg_int   = (df["recorded_at"].iloc[-1] - df["recorded_at"].iloc[0]).total_seconds() / max(len(df)-1,1)
     fut_times = [last_t + timedelta(seconds=avg_int*(i+1)) for i in range(n)]
 
     def forecast(series, n):
@@ -673,7 +634,6 @@ def page_prediction(df):
         fig.update_layout(height=260, title=title, **PLOT_LAYOUT)
         st.plotly_chart(fig, use_container_width=True)
 
-    # Forecast labels
     forecast_labels = [label_health(b, s) for b, s in zip(bpm_f, spo2_f)]
     lc = pd.Series(forecast_labels).value_counts()
     fig3 = go.Figure(go.Bar(x=lc.index, y=lc.values,
@@ -764,11 +724,11 @@ def page_settings():
     st.info("Use Gmail with App Password. Enable 2FA → Google Account → Security → App Passwords")
     c1,c2 = st.columns(2)
     with c1:
-        st.session_state.alert_email   = st.text_input("Recipient Email",   value=st.session_state.alert_email)
-        st.session_state.smtp_user     = st.text_input("Gmail Address",     value=st.session_state.smtp_user)
+        st.session_state.alert_email  = st.text_input("Recipient Email",   value=st.session_state.alert_email)
+        st.session_state.smtp_user    = st.text_input("Gmail Address",     value=st.session_state.smtp_user)
     with c2:
-        st.session_state.smtp_pass     = st.text_input("Gmail App Password",value=st.session_state.smtp_pass, type="password")
-        st.session_state.smtp_enabled  = st.toggle("Enable Alerts",         value=st.session_state.smtp_enabled)
+        st.session_state.smtp_pass    = st.text_input("Gmail App Password",value=st.session_state.smtp_pass, type="password")
+        st.session_state.smtp_enabled = st.toggle("Enable Alerts",         value=st.session_state.smtp_enabled)
     if st.button("📧 Send Test Email"):
         if st.session_state.smtp_user and st.session_state.smtp_pass and st.session_state.alert_email:
             ok, msg = send_email(st.session_state.alert_email, st.session_state.smtp_user,
@@ -780,8 +740,8 @@ def page_settings():
     st.markdown('<div class="sec-head">SYSTEM INFO</div>', unsafe_allow_html=True)
     st.markdown(f"""<div style="background:#07111f;border:1px solid #0f2035;border-radius:12px;padding:20px;
     font-family:'DM Mono',monospace;font-size:11px;color:#4a6a88;line-height:2.2">
-    REGISTRY CHANNEL → {REGISTRY_CHANNEL_ID or 'Not configured'}<br>
-    PLATFORM &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → ThingSpeak (MathWorks)<br>
+    DATABASE &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → Supabase (PostgreSQL)<br>
+    PROJECT URL &nbsp;&nbsp;&nbsp; → {st.secrets.get('supabase',{}).get('url','Not configured')}<br>
     SENSOR &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → MAX30102 (SpO₂ + Heart Rate)<br>
     MCU &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → Arduino Mega 2560<br>
     ML MODELS &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → KNN · Logistic Regression · Random Forest · SVM<br>
@@ -800,44 +760,36 @@ else:
     PATIENT_MAP = {p["id"]: p for p in PATIENTS}
 
     with st.sidebar:
-        # User info
         st.markdown(f"""<div style="padding:16px 0 20px;border-bottom:1px solid #0f2035;margin-bottom:16px">
           <div style="font-size:24px">{st.session_state.avatar}</div>
           <div style="font-weight:700;color:#dce8f5;margin:4px 0">{st.session_state.user_name}</div>
           <div style="font-family:'DM Mono',monospace;font-size:10px;color:#2a4a68;letter-spacing:2px">{st.session_state.role.upper()} ACCESS</div>
         </div>""", unsafe_allow_html=True)
 
-        # Patient selector
         st.markdown("**🧑‍⚕️ Select Patient**")
         if not PATIENTS:
-            st.error("No patients found. Run test_sender.py first.")
+            st.error("No patients found. Run medpulse_supabase.py first.")
             st.stop()
 
-        pat_labels   = [f"{p['id']} — {p['name']}" for p in PATIENTS]
-        pat_choice   = st.selectbox("Patient", pat_labels, label_visibility="collapsed")
-        current_pat  = PATIENTS[pat_labels.index(pat_choice)]
+        pat_labels  = [f"{p['id']} — {p['name']}" for p in PATIENTS]
+        pat_choice  = st.selectbox("Patient", pat_labels, label_visibility="collapsed")
+        current_pat = PATIENTS[pat_labels.index(pat_choice)]
 
-        # Patient info card
-        icon = "👨" if current_pat.get("gender","") == "Male" else "👩"
         st.markdown(f"""<div style="background:#040d18;border:1px solid #0f2035;border-radius:10px;
             padding:14px;margin:10px 0 16px;font-family:'DM Mono',monospace;font-size:10px;color:#4a6a88;line-height:2.1">
-          <span style="color:#dce8f5;font-size:13px;font-weight:700">{icon} {current_pat['name']}</span><br>
-          ID &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → {current_pat['id']}<br>
-          Age &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → {current_pat['age']} · {current_pat.get('gender','')}<br>
-          Doctor &nbsp;&nbsp;&nbsp; → {current_pat['doctor']}<br>
-          Condition → <span style="color:#f97316">{current_pat['condition']}</span><br>
-          Ward &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → {current_pat['ward']}<br>
-          Admitted &nbsp;→ {current_pat['admitted']}
+          <span style="color:#dce8f5;font-size:13px;font-weight:700">🧑 {current_pat['name']}</span><br>
+          ID &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → {current_pat['id']}<br>
+          Age &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → {current_pat.get('age','—')}<br>
+          Doctor &nbsp;&nbsp; → {current_pat.get('doctor','—')}<br>
+          Admitted → {current_pat.get('admitted','—')}
         </div>""", unsafe_allow_html=True)
 
-        # Navigation
         st.markdown("---")
         pages = (["Dashboard","ML Analysis","Anomaly Detection","Prediction","Comparison","PDF Report","Settings"]
                  if st.session_state.role == "doctor"
                  else ["Dashboard","Prediction"])
         page = st.radio("Navigation", pages, label_visibility="collapsed")
 
-        # Settings
         st.markdown("---")
         st.markdown("**⚙️ Settings**")
         bpm_high    = st.number_input("BPM High Threshold",  value=100)
@@ -853,25 +805,21 @@ else:
                 st.session_state[k] = False if k == "logged_in" else ""
             st.rerun()
 
-    # Store channel details in session for train_models cache key
-    st.session_state["_ch_id"] = current_pat["channel_id"]
-    st.session_state["_r_key"] = current_pat["read_api"]
-
-    # Fetch data
+    # Fetch data from Supabase
     with st.spinner(f"Loading data for {current_pat['name']}..."):
-        df, err = fetch_data(current_pat["channel_id"], current_pat["read_api"], num_records)
+        df, err = fetch_data(current_pat["id"], num_records)
 
     if err or df is None:
         st.error(f"No data for **{current_pat['name']}**: {err}")
-        st.info("Run  `python test_sender.py`  and enter this patient's name to start sending data.")
+        st.info("Run `python medpulse_supabase.py` and enter this patient's name to start sending readings.")
         st.stop()
 
     # Train models
-    pkg = train_models(current_pat["channel_id"], f"{current_pat['id']}_{len(df)}")
+    pkg = train_models(current_pat["id"], f"{current_pat['id']}_{len(df)}")
     if pkg is None:
         pkg = {"models": {}, "scaler": StandardScaler(), "iso": None}
 
-    # Route to pages
+    # Route pages
     if   page == "Dashboard":         page_dashboard(df, pkg, current_pat, bpm_high, bpm_low, spo2_low, auto_refresh, refresh_sec)
     elif page == "ML Analysis":        page_ml(df, pkg, current_pat)
     elif page == "Anomaly Detection":  page_anomaly(df, pkg)
