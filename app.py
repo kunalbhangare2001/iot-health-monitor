@@ -118,10 +118,6 @@ for k, v in {
 
 # ═════════════════════════════════════════════════════════
 #  SUPABASE CONNECTION
-#  Add these to Streamlit secrets (.streamlit/secrets.toml):
-#  [supabase]
-#  url = "https://fevnqqwowsbshtakrpuv.supabase.co"
-#  key = "your_anon_public_key"
 # ═════════════════════════════════════════════════════════
 @st.cache_resource
 def get_supabase() -> Client:
@@ -151,7 +147,6 @@ def badge_class(label):
 # ═════════════════════════════════════════════════════════
 @st.cache_data(ttl=30)
 def load_patient_db():
-    """Fetch all patients from Supabase — refreshes every 30s."""
     try:
         supabase = get_supabase()
         res = supabase.table("patients").select("*").order("id").execute()
@@ -160,7 +155,6 @@ def load_patient_db():
     except Exception as e:
         st.sidebar.warning(f"Could not load patients: {e}")
 
-    # Fallback demo patient
     return [{
         "id": "P001", "name": "Demo Patient", "age": 30,
         "doctor": "Dr. Unknown", "admitted": "2026-03-01",
@@ -171,7 +165,6 @@ def load_patient_db():
 # ═════════════════════════════════════════════════════════
 @st.cache_data(ttl=15)
 def fetch_data(patient_id: str, results: int = 300):
-    """Load readings for a patient from Supabase readings table."""
     try:
         supabase = get_supabase()
         res = supabase.table("readings") \
@@ -199,7 +192,7 @@ def fetch_data(patient_id: str, results: int = 300):
         df["spo2"]       = df["spo2"].clip(50, 100)
         df["label"]      = df.apply(lambda r: label_health(r["bpm"], r["spo2"]), axis=1)
         df["date"]       = df["recorded_at"].dt.date
-        df["created_at"] = df["recorded_at"]   # keep alias for chart compatibility
+        df["created_at"] = df["recorded_at"]
         return df, None
 
     except Exception as e:
@@ -487,7 +480,7 @@ def page_dashboard(df, pkg, patient, bpm_high, bpm_low, spo2_low, auto_refresh, 
         st.rerun()
 
 # ═════════════════════════════════════════════════════════
-#  PAGE: ML ANALYSIS
+#  PAGE: ML ANALYSIS  ← BUG 1 FIXED HERE
 # ═════════════════════════════════════════════════════════
 def page_ml(df, pkg, patient):
     if pkg is None or not pkg.get("models"):
@@ -525,7 +518,9 @@ def page_ml(df, pkg, patient):
                             marker_color=["#f97316","#3b82f6","#22c55e","#a855f7"],
                             text=[f"{a:.1f}%" for a in accs], textposition="outside",
                             textfont=dict(color="#dce8f5")))
-    fig.update_layout(height=260, yaxis=dict(range=[0,110]), title="Accuracy on Patient Data", **PLOT_LAYOUT)
+    # FIX: merge yaxis into PLOT_LAYOUT instead of passing as separate kwarg
+    accuracy_layout = {**PLOT_LAYOUT, "yaxis": {**PLOT_LAYOUT.get("yaxis", {}), "range": [0, 110]}}
+    fig.update_layout(height=260, title="Accuracy on Patient Data", **accuracy_layout)
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown('<div class="sec-head">CONFUSION MATRIX — RANDOM FOREST</div>', unsafe_allow_html=True)
@@ -644,7 +639,7 @@ def page_prediction(df):
     st.plotly_chart(fig3, use_container_width=True)
 
 # ═════════════════════════════════════════════════════════
-#  PAGE: COMPARISON
+#  PAGE: COMPARISON  ← BUG 2 FIXED HERE
 # ═════════════════════════════════════════════════════════
 def page_comparison(df):
     st.markdown('<div class="sec-head">TODAY vs YESTERDAY</div>', unsafe_allow_html=True)
@@ -685,7 +680,8 @@ def page_comparison(df):
     ]:
         fig = go.Figure()
         fig.add_trace(go.Scatter(y=vals_t, name=lt, line=dict(color="#f97316", width=2)))
-        fig.add_trace(go.Scatter(y=vals_y, name=ly, line=dict(color="#f9731655", width=2, dash="dot")))
+        # FIX: replaced 8-digit hex "#f9731655" with valid rgba()
+        fig.add_trace(go.Scatter(y=vals_y, name=ly, line=dict(color="rgba(249,115,22,0.33)", width=2, dash="dot")))
         fig.update_layout(height=250, title=title, **PLOT_LAYOUT)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -805,7 +801,6 @@ else:
                 st.session_state[k] = False if k == "logged_in" else ""
             st.rerun()
 
-    # Fetch data from Supabase
     with st.spinner(f"Loading data for {current_pat['name']}..."):
         df, err = fetch_data(current_pat["id"], num_records)
 
@@ -814,12 +809,10 @@ else:
         st.info("Run `python medpulse_supabase.py` and enter this patient's name to start sending readings.")
         st.stop()
 
-    # Train models
     pkg = train_models(current_pat["id"], f"{current_pat['id']}_{len(df)}")
     if pkg is None:
         pkg = {"models": {}, "scaler": StandardScaler(), "iso": None}
 
-    # Route pages
     if   page == "Dashboard":         page_dashboard(df, pkg, current_pat, bpm_high, bpm_low, spo2_low, auto_refresh, refresh_sec)
     elif page == "ML Analysis":        page_ml(df, pkg, current_pat)
     elif page == "Anomaly Detection":  page_anomaly(df, pkg)
